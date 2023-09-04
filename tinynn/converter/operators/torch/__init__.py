@@ -19,6 +19,7 @@ OPERATOR_CONVERTER_DICT: typing.Dict[str, OperatorConverter] = {
     "aten::__getitem__": PrimGetItemConverter,
     "aten::len": PrimLenConverter,
     # aten
+    "aten::sign": AtenSignOperator,
     "aten::t": ATenTOperator,
     "aten::view": ATenViewOperator,
     "aten::reshape": ATenReshapeOperator,
@@ -168,6 +169,7 @@ OPERATOR_CONVERTER_DICT: typing.Dict[str, OperatorConverter] = {
     "aten::roll": ATenRollOperator,
     "aten::round": ATenRoundOperator,
     "aten::norm": ATenNormOperator,
+    "aten::frobenius_norm": ATenFrobeniusNormOperator,
     "aten::scatter_": ATenScatterOperator,
     "aten::abs": ATenAbsOperator,
     "aten::im2col": ATenIm2colOperator,

@@ -50,6 +50,7 @@ class GraphOptimizer(object):
         max_transpose_dims: int = -1,
         bypass_elementwise_passthrough_constraint: bool = False,
         group_tensors: bool = False,
+        conv_transpose_with_bias: bool = True,
     ) -> None:
         self.graph = graph
         self.fuse_tensor_count = 0
@@ -65,6 +66,7 @@ class GraphOptimizer(object):
         self.max_transpose_dims = max_transpose_dims
         self.bypass_elementwise_passthrough_constraint = bypass_elementwise_passthrough_constraint
         self.group_tensors = group_tensors
+        self.conv_transpose_with_bias = conv_transpose_with_bias
 
     def create_attr_tensor(
         self, tensor: tfl.Tensor, name: str = None, quantization: typing.Optional[tfl.QuantizationParameters] = None
@@ -173,6 +175,9 @@ class GraphOptimizer(object):
 
         remove_ids = []
         for pre_activ, activ, tensor in filtered_pairs:
+            if not self.conv_transpose_with_bias and pre_activ['node_type'] == ExtendedOperator.GENERIC_DECONV:
+                continue
+
             # Find out the output of the batch-norm nodes
             new_output = activ['outputs'][0]
             assert new_output in self.graph.tensor_map
@@ -1147,6 +1152,20 @@ class GraphOptimizer(object):
 
             # TODO: Support multi-multi mappings
             if mode == '?':
+                # reset hints if passthrough is not possible
+                for i in input_indices:
+                    prev_node_name = op.inputs[i].name
+                    prev_node = self.graph.graph.vs.find(name=self.graph.tensor_node_map[prev_node_name])
+                    if prev_node['node_type'] == ExtendedOperator.TRANSPOSE:
+                        if 'direction' in prev_node['op'].extra_hints:
+                            prev_node['op'].extra_hints.pop('direction')
+                for edge in node.out_edges():
+                    if edge.index in remove_edges:
+                        continue
+                    next_node = self.graph.graph.vs[edge.target]
+
+                    if 'direction' in next_node['op'].extra_hints:
+                        next_node['op'].extra_hints.pop('direction')
                 continue
 
             check_consecutive_indices = []
@@ -3310,6 +3329,7 @@ class GraphOptimizer(object):
         # Transpose and reshape cleanup
         for _ in range(2):
             self.transpose_to_reshape_pass()
+            self.branch_reshape_expand_pass()
             self.fuse_simple_reshape_pass()
             self.fuse_simple_transpose_pass()
 

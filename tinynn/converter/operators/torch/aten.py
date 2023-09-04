@@ -13,6 +13,15 @@ from .. import tflite as tfl
 log = get_logger(__name__, 'INFO')
 
 
+class AtenSignOperator(ATenSignSchema):
+    def parse(self, node, attrs, args, graph_converter):
+        
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+        self.elementwise_unary(tfl.SignOperator, graph_converter)
+
+
 class ATenLstmOperator(ATenLstmSchema):
     def lstm_input_helper(
         self, input_tensors, params_tensors, has_biases, param_start_index, input_start_index, layer_idx, suffix
@@ -3770,6 +3779,20 @@ class ATenNormOperator(ATenNormSchema):
         self.parse_common(node, attrs, args, graph_converter)
 
 
+class ATenFrobeniusNormOperator(ATenFrobeniusNormSchema):
+    def parse_common(self, node, attrs, args, graph_converter):
+
+        assert 'p' not in args
+        self.input_tensors.insert(1, 2)
+        ATenNormOperator.parse_common(self, node, attrs, args, graph_converter)
+
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+        self.parse_common(node, attrs, args, graph_converter)
+
+        
 class ATenLinalgVectorNormOperator(ATenLinalgVectorNormSchema):
     def parse(self, node, attrs, args, graph_converter):
         super().parse(node, attrs, args, graph_converter)

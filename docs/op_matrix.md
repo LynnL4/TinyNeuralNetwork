@@ -76,6 +76,7 @@ Operators that are implemented in Python
 | `aten::flip` |  |
 | `aten::floor` |  |
 | `aten::floor_divide` | floor_divide for floats is not supported<br>floor_divide for negative numbers is not supported |
+| `aten::frobenius_norm` |  |
 | `aten::gather` |  |
 | `aten::ge` |  |
 | `aten::gelu` |  |
@@ -150,6 +151,7 @@ Operators that are implemented in Python
 | `aten::select` |  |
 | `aten::sigmoid` |  |
 | `aten::sigmoid_` |  |
+| `aten::sign` |  |
 | `aten::silu` |  |
 | `aten::silu_` |  |
 | `aten::sin` |  |

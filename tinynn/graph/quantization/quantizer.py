@@ -88,6 +88,8 @@ FUSE_RULE_LIST_PTQ_ONLY = {
     (nn.Linear, nn.BatchNorm1d): '1.8.0',
     (nn.ConvTranspose1d, nn.BatchNorm1d): '1.11.0',
     (nn.ConvTranspose3d, nn.BatchNorm3d): '1.11.0',
+    (nn.BatchNorm2d, nn.Conv2d): None,
+    (nn.BatchNorm2d, nn.Conv2d, nn.ReLU): None,
 }
 
 FUSE_RULE_LIST_EXTRA = {
@@ -127,11 +129,13 @@ FUSE_QAT_MODULES = {
 }
 
 FUSE_QAT_MODULES_CUSTOM = {}
+FUSE_PTQ_MODULES_CUSTOM = {}
 
 if LooseVersion(torch.__version__) >= '1.13.0':
     from .quantizable.gru import GRU
 
     FUSE_QAT_MODULES_CUSTOM.update({nn.GRU: GRU})
+    FUSE_PTQ_MODULES_CUSTOM.update({nn.GRU: GRU})
 
 FUSE_QAT_MODULES_CVT = {Conv1d: nnq.Conv1d}
 if hasattr(nnq, 'ConvTranspose1d'):
@@ -2392,6 +2396,7 @@ class QATQuantizer(object):
             check_node_quantized=False,
             graph=graph,
             layerwise_config_default=True,
+            use_original_name=False,
         )
         custom_data = ([], set())
         graph.filter_forward_nodes(is_rewrite_to_fuse, custom_data, reverse=True)
@@ -2821,17 +2826,17 @@ class QATQuantizer(object):
 
             for l_dim, r_dim in zip(l_shape, r_shape):
                 if l_dim > r_dim:
-                    if ref_index in (None, 0):
+                    if ref_index in (None, 0) and r_dim == 1:
                         ref_index = 0
                     else:
                         ref_index = -1
-                    break
+                        break
                 elif l_dim < r_dim:
-                    if ref_index in (None, 1):
+                    if ref_index in (None, 1) and l_dim == 1:
                         ref_index = 1
                     else:
                         ref_index = -1
-                    break
+                        break
 
             if ref_index >= 0:
                 src_index = 1 - ref_index
@@ -3700,6 +3705,17 @@ class PostQuantizer(QATQuantizer):
                     "float_to_observed_custom_module_class", {}
                 )
 
+                custom_module_class_mapping.update(FUSE_PTQ_MODULES_CUSTOM)
+
+                def patch_observer_set(orig_func):
+                    def new_no_observer_set():
+                        return set(FUSE_PTQ_MODULES_CUSTOM.values()) | orig_func()
+
+                    return new_no_observer_set
+
+                orig_no_observer_set = sys.modules['torch.ao.quantization.quantize'].no_observer_set
+                sys.modules['torch.ao.quantization.quantize'].no_observer_set = patch_observer_set(orig_no_observer_set)
+
                 add_observer_func(
                     graph.module,
                     qconfig_propagation_list=whitelist,
@@ -4002,9 +4018,11 @@ def load_processed_qat_rules():
 
 def load_processed_ptq_rules():
     if len(processed_ptq_rules) == 0:
-        # Constructor a prefix tree for the QAT rules
+        # Constructor a prefix tree for the PTQ rules
         filtered_ptq_rules = {
-            k for k, v in FUSE_RULE_LIST_PTQ_ONLY.items() if LooseVersion(torch.__version__) >= LooseVersion(v)
+            k
+            for k, v in FUSE_RULE_LIST_PTQ_ONLY.items()
+            if v is None or LooseVersion(torch.__version__) >= LooseVersion(v)
         }
         ptq_rules = set(FUSE_RULE_LIST).union(set(filtered_ptq_rules))
         fuse_rules = sorted(ptq_rules, key=lambda x: len(x), reverse=True)
@@ -4045,7 +4063,9 @@ def load_processed_all_ptq_rules():
     if len(processed_all_ptq_rules) == 0:
         # Constructor a prefix tree for the QAT rules
         filtered_ptq_rules = {
-            k for k, v in FUSE_RULE_LIST_PTQ_ONLY.items() if LooseVersion(torch.__version__) >= LooseVersion(v)
+            k
+            for k, v in FUSE_RULE_LIST_PTQ_ONLY.items()
+            if v is None or LooseVersion(torch.__version__) >= LooseVersion(v)
         }
         ptq_rules = set(FUSE_RULE_LIST).union(set(filtered_ptq_rules)).union(set(FUSE_RULE_LIST_EXTRA))
         fuse_rules = sorted(ptq_rules, key=lambda x: len(x), reverse=True)
