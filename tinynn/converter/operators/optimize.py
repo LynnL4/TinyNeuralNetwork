@@ -2737,23 +2737,13 @@ class GraphOptimizer(object):
                     # Get the node of the requantized tensor
                     requantized_node_name = self.graph.tensor_node_map[requantized.name]
                     requantized_node = self.graph.graph.vs.find(name=requantized_node_name)
-                    
-                    # Connect the quantize op to the graph
-                    node_in = self.graph.graph.vs.find(name=self.graph.tensor_node_map[op_in.name])
-                    self.graph.replace_next_tensors(node_in, requantized_node, requantized.name, [requantized_node_name])
-                    
-                    # Connect the quantize op to the graph 
-                    self.graph.replace_operator_input(cat, i, requantized)
 
-                    
-                    
-               
-                    
-                    
-                    
+                    # Connect the requantized node to between the previous node and the concatenate node
+                    op.inputs[i] = self.graph.tensor_map[requantized.name]
+                    self.graph.graph.add_edge(requantized_node, cat, name=requantized.name, label=requantized.name)
                 
+               
         
-
 
     def input_transpose_pass(self):
         nhwc2nchw_perm = np.array([0, 3, 1, 2], dtype='int32')
