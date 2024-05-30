@@ -58,6 +58,8 @@ class TFLiteConverter(object):
         hybrid_gen_single_op_models: bool = False,
         hybrid_config: typing.Optional[typing.Dict[str, bool]] = None,
         group_tensors: bool = False,
+        missing_outputs_as_constants: bool = False,
+        legacy_gelu: bool = False,
     ) -> None:
         """ The TFLiteConverter class
 
@@ -110,6 +112,8 @@ class TFLiteConverter(object):
             hybrid_gen_single_op_models: Generate both floating point and quantized version of the model for hybrid \
                 quantizable ops. Defaults to False
             group_tensors (bool): Group tensors to save space. Defaults to False
+            missing_outputs_as_constants (bool): View missing outputs as constants. Defaults to False
+            legacy_gelu (bool): Fallback to the legacy behaviour for translating gelu. Defaults to False
         """
 
         self.model = model
@@ -164,6 +168,8 @@ class TFLiteConverter(object):
         self.hybrid_gen_single_op_models = hybrid_gen_single_op_models
         self.hybrid_config = hybrid_config
         self.group_tensors = group_tensors
+        self.missing_outputs_as_constants = missing_outputs_as_constants
+        self.legacy_gelu = legacy_gelu
 
         if quantize_target_type == 'uint8':
             self.q_type = np.uint8
@@ -386,6 +392,8 @@ class TFLiteConverter(object):
     def init_operations(self):
         log.debug('Initialize operators...')
         node_queue = collections.deque(self.graph.nodes())
+        scope_map = {}
+        current_scope = None
         while node_queue:
             node = node_queue.popleft()
 
@@ -396,6 +404,7 @@ class TFLiteConverter(object):
             converter = converter_type(
                 node,
                 self.tensor_map,
+                current_scope,
                 not self.strict_symmetric_check,
                 self.q_type,
                 self.hybrid_q_type,
@@ -405,6 +414,7 @@ class TFLiteConverter(object):
                 self.unroll_rnn,
                 self.separated_rnn_gate_calc,
                 self.conv_transpose_with_bias,
+                self.legacy_gelu,
             )
             # Don't track the operator if all the input nodes are not tracked unless it has custom implementation
             # (e.g prim::* ops)
@@ -426,7 +436,19 @@ class TFLiteConverter(object):
                     else:
                         converter_type = NoTrackOperator
                     converter = converter_type(
-                        node, self.tensor_map, not self.strict_symmetric_check, self.q_type, self.hybrid_q_type
+                        node,
+                        self.tensor_map,
+                        current_scope,
+                        not self.strict_symmetric_check,
+                        self.q_type,
+                        self.hybrid_q_type,
+                        self.map_bilstm_to_lstm,
+                        self.enable_mtk_ops,
+                        self.hybrid_asymmetric_inputs,
+                        self.unroll_rnn,
+                        self.separated_rnn_gate_calc,
+                        self.conv_transpose_with_bias,
+                        self.legacy_gelu,
                     )
             if k != 'prim::Constant':
                 log.debug(f'{k} {converter.input_names} -> {converter.output_names} {converter_type.__name__}')
@@ -447,6 +469,15 @@ class TFLiteConverter(object):
                 output_tensors.extend(converter.get_output_tensors())
             if len(new_nodes) > 0:
                 node_queue.extendleft(reversed(new_nodes))
+
+            if k == 'prim::PythonOp':
+                s = node.scopeName()
+                scope_map.setdefault(s, 0)
+                scope_map[s] += 1
+                current_scope = f'{s}_{scope_map[s]}'
+                converter.prepare_scope_tensors(node, attrs, args, self.common_graph, current_scope)
+            elif k == 'prim::Return':
+                current_scope = None
 
             assert len(output_tensors) == len(outputs)
             for t, name in zip(output_tensors, outputs):
@@ -523,6 +554,22 @@ class TFLiteConverter(object):
 
             versioner = OPVersioner(self.common_graph)
             versioner.process()
+
+            if self.missing_outputs_as_constants:
+                tensors = []
+                for output_name in self.common_graph.outputs:
+                    if output_name not in self.common_graph.tensor_map:
+                        tensors.append(
+                            Tensor(
+                                self.tensor_map[output_name],
+                                output_name,
+                                has_buffer=True,
+                                asymmetric=not self.strict_symmetric_check,
+                                q_type=self.q_type,
+                            )
+                        )
+                self.common_graph.add_nodes(tensors, ExtendedOperator.CONSTANT_NODE)
+                self.common_graph.add_outputs([t.name for t in tensors])
 
             self.common_graph.convert(self.tflite_path)
 

@@ -14,6 +14,9 @@ Operators that are implemented in Python
 | `prim::ListConstruct` |  |
 | `prim::ListUnpack` |  |
 | `prim::NumToTensor` |  |
+| `prim::Param` |  |
+| `prim::PythonOp` |  |
+| `prim::Return` |  |
 | `prim::TupleConstruct` |  |
 
 ## ATen Operators
@@ -93,7 +96,9 @@ Operators that are implemented in Python
 | `aten::hardtanh` |  |
 | `aten::hardtanh_` |  |
 | `aten::im2col` | only 4-D input tensors (batched image-like tensors) are supported |
-| `aten::index` | Multiple indices for aten::index is not supported |
+| `aten::index` |  |
+| `aten::index_put` | aten::index_put_ with accumulate=True is not supported |
+| `aten::index_put_` | aten::index_put_ with accumulate=True is not supported |
 | `aten::index_select` |  |
 | `aten::instance_norm` |  |
 | `aten::layer_norm` |  |
@@ -111,9 +116,11 @@ Operators that are implemented in Python
 | `aten::matmul` |  |
 | `aten::max` |  |
 | `aten::max_pool2d` | Only dilation == 1 is supported |
+| `aten::maximum` |  |
 | `aten::mean` |  |
 | `aten::meshgrid` | aten::meshgrid for dynamic tensors is not supported |
 | `aten::min` |  |
+| `aten::minimum` |  |
 | `aten::mish` |  |
 | `aten::mm` |  |
 | `aten::mul` |  |
@@ -140,6 +147,7 @@ Operators that are implemented in Python
 | `aten::relu_` |  |
 | `aten::remainder` |  |
 | `aten::repeat` |  |
+| `aten::repeat_interleave` | dynamic repeats_tensor is not supported |
 | `aten::reshape` |  |
 | `aten::roll` |  |
 | `aten::round` |  |
@@ -216,8 +224,6 @@ Operators that are implemented in Python
 Non-tracking operators that are ignored during translation
 | Operator                  | Limitations  |
 |---------------------------|--------------|
-| `aten::Int` |  |
-| `aten::ScalarImplicit` |  |
 | `aten::arange` |  |
 | `aten::detach` |  |
 | `aten::empty` |  |
@@ -228,3 +234,10 @@ Non-tracking operators that are ignored during translation
 | `aten::size` |  |
 | `aten::zeros` |  |
 | `aten::zeros_like` |  |
+
+## Constant Tracking Operators
+Tracking operators that produce a dynamic constant
+| Operator                  | Limitations  |
+|---------------------------|--------------|
+| `aten::Int` |  |
+| `aten::ScalarImplicit` |  |

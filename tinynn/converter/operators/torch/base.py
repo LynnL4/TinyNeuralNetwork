@@ -21,6 +21,7 @@ class OperatorConverter(ABC):
         self,
         node,
         tensor_map,
+        scope_name,
         asymmetric=True,
         q_type=np.uint8,
         hybrid_q_type=np.int8,
@@ -30,7 +31,9 @@ class OperatorConverter(ABC):
         unroll_rnn=False,
         separated_rnn_gate_calc=False,
         conv_transpose_with_bias=True,
+        legacy_gelu=False,
     ) -> None:
+        self.scope_name = scope_name
         self.input_names = self.get_input_names(node)
         self.output_names = self.get_output_names(node)
         self.input_tensors = self.get_input_tensors(tensor_map)
@@ -48,16 +51,26 @@ class OperatorConverter(ABC):
         self.unroll_rnn = unroll_rnn
         self.separated_rnn_gate_calc = separated_rnn_gate_calc
         self.conv_transpose_with_bias = conv_transpose_with_bias
+        self.legacy_gelu = legacy_gelu
 
     @abstractmethod
     def parse(self, node, attrs, args, graph_converter):
         pass
 
+    def get_tensor_name(self, tensor_name, scope_name=None):
+        if scope_name is None:
+            scope_name = self.scope_name
+
+        if scope_name:
+            return f'{scope_name}_{tensor_name}'
+        else:
+            return tensor_name
+
     def get_input_names(self, node):
-        return [x.debugName() for x in list(node.inputs())]
+        return [self.get_tensor_name(x.debugName()) for x in list(node.inputs())]
 
     def get_output_names(self, node):
-        return [x.debugName() for x in list(node.outputs())]
+        return [self.get_tensor_name(x.debugName()) for x in list(node.outputs())]
 
     def get_input_tensors(self, tensor_map):
         input_tensors = []
@@ -677,6 +690,8 @@ def get_prop_from_node(node, prop, assert_type=None, return_type=False):
             v = getattr(node, vk)(prop)
         elif vk == 's':
             v = getattr(node, vk)(prop)
+        elif vk == 'g':
+            v = getattr(node, vk)(prop)
         elif vk == 't':
             v = getattr(node, vk)(prop)
             if v.dtype == torch.float64:
@@ -755,6 +770,16 @@ class TrackQParamsOperator(OperatorConverter):
 
         t = self.find_or_create_input(0, graph_converter)
         graph_converter.q_mapping[self.output_names[0]] = t
+
+
+class TrackConstantOperator(OperatorConverter):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+
+        t = self.find_or_create_input(0, graph_converter)
+        graph_converter.constant_mapping[self.output_names[0]] = t
 
 
 class PrimOperatorConverter(OperatorConverter):

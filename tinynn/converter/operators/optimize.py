@@ -167,6 +167,68 @@ class GraphOptimizer(object):
             assert vertex['node_type'] == ExtendedOperator.BATCH_NORM
         self.graph.graph.delete_vertices(remove_ids)
 
+    @class_conditional(lambda self: self.level >= GraphOptimizer.FUSE_BN)
+    def fuse_bn_conv(self):
+        edges = self.graph.graph.es.select(functools.partial(is_rev_bn_fusable_edge, graph_converter=self.graph.graph))
+        filtered_pairs = ((self.graph.graph.vs[x.source], self.graph.graph.vs[x.target]) for x in edges)
+
+        def _remove_last_pred(seq):
+            bn = seq[0]
+            conv = seq[1]
+
+            # Collect the arguments of the conv and batch-norm nodes
+            weight = conv['op'].inputs[1]
+            bias = conv['op'].inputs[2] if len(conv['op'].inputs) > 2 else None
+            bn_w, bn_b, bn_mean, bn_var = bn['op'].inputs[1:]
+            bn_w, bn_b, bn_mean, bn_var = (
+                bn_w.tensor.copy(),
+                bn_b.tensor.copy(),
+                bn_mean.tensor.copy(),
+                bn_var.tensor.copy(),
+            )
+            activ_w = weight.tensor.copy()
+            activ_b = bias.tensor.copy() if bias is not None else None
+            eps = bn['op'].eps
+
+            new_weight = fuse_rev_bn_weight(eps, bn_w, bn_var, activ_w)
+            new_bias = fuse_rev_bn_bias(eps, bn_w, bn_var, bn_mean, bn_b, activ_b, activ_w)
+
+            return False, (conv, bias, new_weight, new_bias)
+
+        def _remove_last_action(first_node, last_node, custom_data):
+            conv, bias, new_weight, new_bias = custom_data
+
+            new_w = self.create_attr_tensor(new_weight)
+            new_b = self.create_attr_tensor(new_bias)
+
+            actions = []
+            actions.append((self.graph.replace_operator_input, (conv, 1, new_w)))
+            if bias is not None:
+                actions.append((self.graph.replace_operator_input, (conv, 2, new_b)))
+            else:
+                actions.append((self.graph.append_operator_input, (conv, new_b)))
+            return actions
+
+        def _skip_pred(seq):
+            bn = seq[0]['op']
+            conv = seq[1]['op']
+
+            skip = bn.inputs[0].quantization is not None or (
+                conv.inputs[1].shape[1] == 1 and conv.inputs[1].shape[0] == conv.groups and conv.groups > 1
+            )
+            return skip
+
+        elinimate_sequences(
+            self.graph,
+            filtered_pairs,
+            True,
+            None,
+            _remove_last_pred,
+            _remove_last_action,
+            _skip_pred,
+            force_forward_input=True,
+        )
+
     @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
     def fuse_activation(self):
         # Find fusable ops
@@ -1867,7 +1929,12 @@ class GraphOptimizer(object):
                     actions.append((self.graph.replace_operator_input, (node, 1, new_weight, True)))
             elif node['node_type'] in (ExtendedOperator.SLICE, ExtendedOperator.STRIDED_SLICE):
                 for i, t in enumerate(op.inputs[1:]):
-                    new_t = self.create_attr_tensor(t.tensor[inv_perm_arr])
+                    if t.buffer is None:
+                        new_perm_t = self.create_attr_tensor(np.array(inv_perm_arr, dtype='int32'))
+                        new_t = self.create_transform_tensor(t.tensor[inv_perm_arr])
+                        self.graph.add_operator(tfl.TransposeOperator([t, new_perm_t], [new_t]))
+                    else:
+                        new_t = self.create_attr_tensor(t.tensor[inv_perm_arr])
                     actions.append((self.graph.replace_operator_input, (node, i + 1, new_t, True)))
             elif node['node_type'] in (
                 ExtendedOperator.SUM,
@@ -2240,11 +2307,63 @@ class GraphOptimizer(object):
 
                 new_start = np.zeros(len(prev_shape), dtype='int32')
                 new_start[new_dim] = op.inputs[1].tensor[old_dim]
-                new_start_t = self.create_attr_tensor(new_start)
+                if op.inputs[1].buffer is None:
+                    new_start_t = self.create_transform_tensor(new_start)
+                    starts_mid = new_start[new_dim : new_dim + 1]
+                    starts_mid_tensor = self.create_transform_tensor(starts_mid)
+
+                    slice_inputs = [
+                        op.inputs[1],
+                        self.create_attr_tensor(np.array([old_dim], dtype='int32')),
+                        self.create_attr_tensor(np.array([1], dtype='int32')),
+                    ]
+
+                    self.graph.add_operator(tfl.SliceOperator(slice_inputs, [starts_mid_tensor]))
+
+                    starts_left = new_start[:new_dim]
+                    starts_right = new_start[new_dim + 1 :]
+                    starts_tensors = []
+                    if len(starts_left) > 0:
+                        starts_tensors.append(self.create_attr_tensor(starts_left))
+                    starts_tensors.append(starts_mid_tensor)
+                    if len(starts_right) > 0:
+                        starts_tensors.append(self.create_attr_tensor(starts_right))
+                    if len(starts_tensors) > 1:
+                        self.graph.add_operator(tfl.ConcatenationOperator(starts_tensors, [new_start_t], 0))
+                    else:
+                        new_start_t = starts_tensors[0]
+                else:
+                    new_start_t = self.create_attr_tensor(new_start)
 
                 new_end = np.array(prev_shape, dtype='int32')
                 new_end[new_dim] = op.inputs[2].tensor[old_dim]
-                new_end_t = self.create_attr_tensor(new_end)
+                if op.inputs[2].buffer is None:
+                    new_end_t = self.create_transform_tensor(new_end)
+                    ends_mid = new_end[new_dim : new_dim + 1]
+                    ends_mid_tensor = self.create_transform_tensor(ends_mid)
+
+                    slice_inputs = [
+                        op.inputs[2],
+                        self.create_attr_tensor(np.array([old_dim], dtype='int32')),
+                        self.create_attr_tensor(np.array([1], dtype='int32')),
+                    ]
+
+                    self.graph.add_operator(tfl.SliceOperator(slice_inputs, [ends_mid_tensor]))
+
+                    ends_left = new_end[:new_dim]
+                    ends_right = new_end[new_dim + 1 :]
+                    ends_tensors = []
+                    if len(ends_left) > 0:
+                        ends_tensors.append(self.create_attr_tensor(ends_left))
+                    ends_tensors.append(ends_mid_tensor)
+                    if len(ends_right) > 0:
+                        ends_tensors.append(self.create_attr_tensor(ends_right))
+                    if len(ends_tensors) > 1:
+                        self.graph.add_operator(tfl.ConcatenationOperator(ends_tensors, [new_end_t], 0))
+                    else:
+                        new_end_t = ends_tensors[0]
+                else:
+                    new_end_t = self.create_attr_tensor(new_end)
 
                 new_stride = np.ones(len(prev_shape), dtype='int32')
                 new_stride[new_dim] = op.inputs[3].tensor[old_dim]
@@ -3295,6 +3414,7 @@ class GraphOptimizer(object):
         self.fuse_conv_fc_bn()
         self.fuse_activation()
         self.fuse_requantize()
+        self.fuse_bn_conv()
 
         # Convert TinyNeuralNetwork ops to TFLite ops
         self.transform_graph()
@@ -3404,6 +3524,20 @@ def is_bn_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
             or source_vertex['op'].fusedActivationFunction
             in (ActivationFunctionType.NONE, target_vertex['op'].fusedActivationFunction)
         )
+    )
+
+
+def is_rev_bn_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
+    source_vertex = graph_converter.vs[edge.source]
+    target_vertex = graph_converter.vs[edge.target]
+    return (
+        target_vertex['node_type'] == ExtendedOperator.GENERIC_CONV
+        and source_vertex['node_type'] == ExtendedOperator.BATCH_NORM
+        and source_vertex.outdegree() == 1
+        and source_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].inputs[2].buffer is not None
+        and target_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].fusedActivationFunction == ActivationFunctionType.NONE
     )
 
 
@@ -3860,6 +3994,8 @@ def is_slice_fusable_edge(edge: ig.Edge, graph_converter: ig.Graph):
         and target_vertex['node_type'] in (ExtendedOperator.SLICE, ExtendedOperator.STRIDED_SLICE)
         and target_vertex.outdegree() >= 1
         and source_vertex['outputs'][0] == target_vertex['op'].inputs[0].name
+        and source_vertex['op'].inputs[1].buffer is not None
+        and source_vertex['op'].inputs[2].buffer is not None
     )
 
 
@@ -4098,6 +4234,33 @@ def fuse_bn_bias(eps, scale, var, mean, bn_b, activ_b):
         return (-mean) * inv * scale + bn_b
 
 
+def fuse_rev_bn_weight(eps, scale, var, weight):
+    shape = [1, -1] + [1] * (len(weight.shape) - 2)
+
+    inv = 1 / np.sqrt(var + eps)
+
+    return weight * (scale * inv).reshape(shape)
+
+
+def fuse_rev_bn_bias(eps, scale, var, mean, bn_b, activ_b, weight):
+    reduced_dims = tuple([i for i in range(len(weight.shape)) if i > 1])
+
+    inv = 1 / np.sqrt(var + eps)
+    fused_b = bn_b - mean * inv * scale
+
+    if weight.shape[1] == 1 and mean.shape[0] > 1:
+        offset_b = (weight.sum(reduced_dims) * fused_b.reshape(-1, 1)).reshape(-1)
+    else:
+        offset_b = np.matmul(weight.sum(reduced_dims), fused_b.reshape(-1, 1)).reshape(-1)
+
+    if activ_b is not None:
+        if activ_b.shape != mean.shape and activ_b.ndim == 1 and activ_b.size == 1:
+            activ_b = activ_b.repeat(mean.size)
+        return activ_b + offset_b
+    else:
+        return offset_b
+
+
 def fuse_slices(seq: typing.Iterable[ig.Vertex]):
     cur_start = None
     cur_end = None
@@ -4162,15 +4325,25 @@ def fuse_transpose_perms_extended(seq: typing.Iterable[ig.Vertex]):
                 old_shape = node['op'].outputs[0].shape
 
             if old_shape != new_shape:
-                new_shape_padded = list(new_shape) + [None] * (len(old_shape) - len(new_shape))
-                next_perm = []
-                new_idx = 0
-                while new_idx < len(new_shape):
-                    for old, item in zip(old_shape, cur_perm):
-                        if old == new_shape_padded[new_idx] and item not in next_perm:
-                            next_perm.append(item)
-                            new_idx += 1
-                cur_perm = np.argsort(next_perm)
+                if len(old_shape) != len(new_shape):
+                    new_shape_padded = list(new_shape) + [None] * (len(old_shape) - len(new_shape))
+                    next_perm = []
+                    new_idx = 0
+                    while new_idx < len(new_shape):
+                        for old, item in zip(old_shape, cur_perm):
+                            if old == new_shape_padded[new_idx] and item not in next_perm:
+                                next_perm.append(item)
+                                new_idx += 1
+                    cur_perm = np.argsort(next_perm)
+                else:
+                    mapping = {}
+                    for i in range(len(new_shape)):
+                        mapping.setdefault(new_shape[i], [])
+                        mapping[new_shape[i]].append(i)
+                    next_perm = [0] * len(old_shape)
+                    for i in range(len(old_shape)):
+                        next_perm[i] = mapping[old_shape[i]].pop(0)
+                    cur_perm = cur_perm[next_perm]
 
     return cur_perm
 

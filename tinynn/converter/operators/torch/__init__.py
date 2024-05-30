@@ -18,6 +18,9 @@ OPERATOR_CONVERTER_DICT: typing.Dict[str, OperatorConverter] = {
     "prim::If": PrimIfConverter,
     "aten::__getitem__": PrimGetItemConverter,
     "aten::len": PrimLenConverter,
+    "prim::Param": PrimParamConverter,
+    "prim::PythonOp": PrimPythonOpConverter,
+    "prim::Return": PrimReturnConverter,
     # aten
     "aten::sign": AtenSignOperator,
     "aten::t": ATenTOperator,
@@ -179,6 +182,11 @@ OPERATOR_CONVERTER_DICT: typing.Dict[str, OperatorConverter] = {
     "aten::baddbmm": ATenBaddbmmOperator,
     "aten::linalg_vector_norm": ATenLinalgVectorNormOperator,
     "aten::broadcast_tensors": ATenBroadcastTensorsOperator,
+    "aten::maximum": ATenMaximumOperator,
+    "aten::minimum": ATenMinimumOperator,
+    "aten::index_put": ATenIndexPutOperator,
+    "aten::index_put_": ATenIndexPutOperator,
+    "aten::repeat_interleave": ATenRepeatInterleaveOperator,
     # quantized
     "aten::quantize_per_tensor": ATenQuantizePerTensorOperator,
     "aten::fake_quantize_per_tensor_affine": ATenFakeQuantizePerTensorAffineOperator,
@@ -209,7 +217,7 @@ OPERATOR_CONVERTER_DICT: typing.Dict[str, OperatorConverter] = {
     "quantized::linear_relu_dynamic": QuantizedLinearReluDynamicOperator,
     "quantized::elu": QuantizedEluOperator,
     # non tracking
-    "aten::Int": NoTrackOperator,
+    "aten::Int": TrackConstantOperator,
     "aten::zeros": NoTrackOperator,
     "aten::detach": NoTrackOperator,
     "aten::size": NoTrackOperator,
@@ -220,5 +228,5 @@ OPERATOR_CONVERTER_DICT: typing.Dict[str, OperatorConverter] = {
     "aten::empty": NoTrackOperator,
     "aten::new_zeros": NoTrackOperator,
     "aten::new_ones": NoTrackOperator,
-    "aten::ScalarImplicit": NoTrackOperator,
+    "aten::ScalarImplicit": TrackConstantOperator,
 }

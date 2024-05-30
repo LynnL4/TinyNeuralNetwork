@@ -591,8 +591,14 @@ class TraceFunction(object):
                     new_arg.append('{}')
                 elif type(a) in (str, torch.device):
                     new_arg.append(_escape_arg(f"\'{a}\'"))
-                elif type(a) in (int, float, bool, torch.dtype):
+                elif type(a) in (int, bool, torch.dtype):
                     new_arg.append(str(a))
+                elif type(a) is float:
+                    str_arg = str(a)
+                    if str_arg in ('nan', 'inf', '-inf'):
+                        new_arg.append(f"float('{str_arg}')")
+                    else:
+                        new_arg.append(str_arg)
                 elif a is None:
                     new_arg.append('None')
                 elif a is Ellipsis:
@@ -1751,7 +1757,9 @@ def tracer_context():
     lock(False)
     module_constructor_traced.clear()
     module_constructor_lines.clear()
+    module_constructor_weakrefs.clear()
     original_values_for_tracked_objects.clear()
+    skip_modules.clear()
 
 
 @contextlib.contextmanager
@@ -2772,7 +2780,7 @@ class TraceGraph(object):
             for old_idx, new_idx in index_mapping:
                 prev_unique_name = tensor_name_from_parts(old_unique_name, old_idx, is_constant_node)
                 next_unique_name = tensor_name_from_parts(new_node.unique_name, new_idx, is_new_constant_node)
-                log.debug('tensor rename: ', prev_unique_name, '->', next_unique_name)
+                log.debug(f'tensor rename: {prev_unique_name} -> {next_unique_name}')
                 next_node.module.replace_tensor_name(prev_unique_name, next_unique_name)
                 next_node.module.update_args_string()
 
@@ -2896,7 +2904,7 @@ class TraceGraph(object):
                 next_unique_name = tensor_name_from_parts(
                     new_node.unique_name, new_idx, is_constant_node=is_next_constant_node
                 )
-                log.debug('node rename: ', prev_unique_name, '->', next_unique_name)
+                log.debug(f'node rename: {prev_unique_name} -> {next_unique_name}')
                 node.module.replace_tensor_name(prev_unique_name, next_unique_name)
                 node.module.update_args_string()
 
@@ -3009,7 +3017,7 @@ class TraceGraph(object):
                         if type(n.module) == TraceFunction:
                             prev_unique_name = tensor_name_from_parts(old_unique_name, idx, is_constant_node)
                             next_unique_name = tensor_name_from_parts(node.unique_name, idx, is_new_constant_node)
-                            log.debug('node rename: ', prev_unique_name, '->', next_unique_name)
+                            log.debug(f'node rename: {prev_unique_name} -> {next_unique_name}')
                             n.module.replace_tensor_name(prev_unique_name, next_unique_name)
                             n.module.update_args_string()
                         break

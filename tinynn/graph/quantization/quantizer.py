@@ -693,21 +693,22 @@ class QATQuantizer(object):
         )
 
         if self.backend != 'tensorrt':
+            is_qat = type(self) is QATQuantizer
             for quant_nodes in quant_list:
                 if self.inplace:
                     quant_nodes = [re.sub('get_submodule\\("(.*?)"\\)', '\\1', x) for x in quant_nodes]
                     quant_nodes = [re.sub('\\[("|)(.*?)("|)\\]', '.\\2', x) for x in quant_nodes]
 
-                if type(self) != PostQuantizer and LooseVersion(torch.__version__) >= '1.11.0':
+                if LooseVersion(torch.__version__) >= '1.11.0' and LooseVersion(torch.__version__) < '1.14.0':
                     # See https://github.com/pytorch/pytorch/pull/88193
-                    if LooseVersion(torch.__version__) < '1.14.0':
-                        sys.modules['torch.quantization.fuse_modules']._fuse_modules(
-                            graph.module, quant_nodes, is_qat=True, inplace=True, fuser_func=new_fuser_func
-                        )
-                    else:
-                        torch.ao.quantization.fuse_modules_qat(
-                            graph.module, quant_nodes, fuser_func=new_fuser_func, inplace=True
-                        )
+                    sys.modules['torch.quantization.fuse_modules']._fuse_modules(
+                        graph.module, quant_nodes, is_qat=is_qat, inplace=True, fuser_func=new_fuser_func
+                    )
+                elif is_qat and LooseVersion(torch.__version__) >= '1.14.0':
+                    # See https://github.com/pytorch/pytorch/issues/74028
+                    torch.ao.quantization.fuse_modules_qat(
+                        graph.module, quant_nodes, fuser_func=new_fuser_func, inplace=True
+                    )
                 else:
                     torch_q.fuse_modules(graph.module, quant_nodes, fuser_func=new_fuser_func, inplace=True)
 
@@ -2449,28 +2450,20 @@ class QATQuantizer(object):
                 graph.replace_node_module(node_fc, new_conv2d)
                 graph.replace_node_module(node_bn1d, new_bn2d)
 
-                prev_tensor_shape = node_fc.prev_tensors[0].shape
-                prev_func = TraceFunction('torch.reshape').parse_args(
-                    node_fc.prev_tensors[0], [prev_tensor_shape[0], prev_tensor_shape[1], 1, 1]
+                prev_func = TraceFunction('torch.Tensor.__getitem__', prefix='rewritten_conv2d_bn2d_').parse_args(
+                    node_fc.prev_tensors[0], (Ellipsis, None, None)
                 )
-                next_tensor_shape = node_bn1d.next_tensors[0].shape
-                next_func = TraceFunction('torch.reshape').parse_args(
-                    node_bn1d.next_tensors[0], [next_tensor_shape[0], next_tensor_shape[1]]
+                next_func = TraceFunction('torch.flatten', prefix='rewritten_conv2d_bn2d_').parse_args(
+                    node_bn1d.next_tensors[0], 1
                 )
             # expand the tensor shape between fc new_conv2d and new_bn2d
             node_fc.next_tensors[0].unsqueeze_(2).unsqueeze_(2)
             node_bn1d.prev_tensors[0].unsqueeze_(2).unsqueeze_(2)
             node_bn1d.next_tensors[0].unsqueeze_(2).unsqueeze_(2)
 
-            prev_out = torch.reshape(
-                node_fc.prev_tensors[0],
-                [node_fc.prev_tensors[0].shape[0], node_fc.prev_tensors[0].shape[1], 1, 1],
-            )
+            prev_out = node_fc.prev_tensors[0][..., None, None]
             graph.insert_between(node_fc.prev_nodes[0], node_fc, prev_func, [prev_out])
-            next_out = torch.reshape(
-                node_bn1d.next_tensors[0],
-                [node_bn1d.next_tensors[0].shape[0], node_bn1d.prev_tensors[0].shape[1]],
-            )
+            next_out = torch.flatten(node_bn1d.next_tensors[0], 1)
             graph.insert_after(node_bn1d, next_func, [next_out])
 
         # Rewrite BatchNorm1d to BatchNorm2d
@@ -2509,8 +2502,12 @@ class QATQuantizer(object):
                 with override_current_trace_graph(graph):
                     graph.replace_node_module(node, new_bn)
 
-                    prev_func = TraceFunction('torch.unsqueeze').parse_args(node.prev_tensors[0], 2)
-                    next_func = TraceFunction('torch.squeeze').parse_args(node.next_tensors[0], 2)
+                    prev_func = TraceFunction('torch.unsqueeze', prefix='rewritten_bn2d_').parse_args(
+                        node.prev_tensors[0], 2
+                    )
+                    next_func = TraceFunction('torch.squeeze', prefix='rewritten_bn2d_').parse_args(
+                        node.next_tensors[0], 2
+                    )
 
                 node.next_tensors[0].unsqueeze_(2)
 
@@ -2903,18 +2900,17 @@ class QATQuantizer(object):
         if current_rules is None:
             return False
 
-        if check_node_quantized:
-            if not node.quantized:
-                return False
-        else:
-            if self.layerwise_config.get(node.unique_name, layerwise_config_default) is False:
-                return False
-
         cur_node = node
         names = []
         final_names = []
         current_state = False
         while True:
+            if check_node_quantized:
+                if not cur_node.quantized:
+                    break
+            else:
+                if self.layerwise_config.get(cur_node.unique_name, layerwise_config_default) is False:
+                    break
             cur_module = cur_node.module
             cur_class = type(cur_module)
             if isinstance(cur_module, TraceFunction):
@@ -2933,7 +2929,7 @@ class QATQuantizer(object):
                     break
                 if cur_class in current_rules:
                     current_state, current_rules = current_rules[cur_class]
-                    log.debug('dict: ', current_rules, current_state)
+                    log.debug(f'dict: {current_rules}, {current_state}')
                     names.append(cur_name)
                     if current_state is True:
                         log.debug(f'update best: {names}')
@@ -2956,7 +2952,7 @@ class QATQuantizer(object):
 
         if len(final_names) > 0:
             final_names.reverse()
-            log.debug('final:', final_names)
+            log.debug(f'final: {final_names}')
             custom_data[0].append(final_names)
             for name in final_names:
                 custom_data[1].add(name)
@@ -3715,8 +3711,11 @@ class PostQuantizer(QATQuantizer):
 
                     return new_no_observer_set
 
-                orig_no_observer_set = sys.modules['torch.ao.quantization.quantize'].no_observer_set
-                sys.modules['torch.ao.quantization.quantize'].no_observer_set = patch_observer_set(orig_no_observer_set)
+                if LooseVersion(torch.__version__) >= LooseVersion("1.9.0"):
+                    orig_no_observer_set = sys.modules['torch.ao.quantization.quantize'].no_observer_set
+                    sys.modules['torch.ao.quantization.quantize'].no_observer_set = patch_observer_set(
+                        orig_no_observer_set
+                    )
 
                 add_observer_func(
                     graph.module,
