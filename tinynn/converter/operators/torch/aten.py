@@ -430,6 +430,7 @@ class ATenLstmOperator(ATenLstmSchema):
                     pack_op.extra_hints['warn_on_unused'] = False
                     ops.append(pack_op)
         else:
+            ops[-1].extra_hints['cell_output'] = self.output_names[-1]
             common_names = set(self.output_names[1:]) & set(graph_converter.outputs)
             assert len(common_names) == 0, (
                 f"Please remove the LSTM state outputs ({common_names}) from the model. Alternatively, you can try"
@@ -554,7 +555,6 @@ class ATenGruOperator(ATenGruSchema):
     ):
         assert is_train in (False, 0)
         self.unroll_rnn = True
-        self.separated_rnn_gate_calc = True
 
         expected_num_params = 2 * num_layers
         params_step = 2
@@ -685,73 +685,159 @@ class ATenGruOperator(ATenGruSchema):
                     for i, t in enumerate(input_ts[::stride]):
 
                         input_mm_list = []
-                        for j, (w_i, b_i) in enumerate(zip(w_i_list, b_i_list)):
+
+                        if not self.separated_rnn_gate_calc:
+
+                            wir, wiz, win = w_i_list
+                            whr, whz, whn = w_r_list
+                            bir, biz, bin = b_i_list
+                            bhr, bhz, bhn = b_r_list
+
+                            w_i = self.create_attr_tensor(np.concatenate([wir.tensor, wiz.tensor, win.tensor], 0))
+                            w_h = self.create_attr_tensor(np.concatenate([whr.tensor, whz.tensor, whn.tensor], 0))
+                            b_i = self.create_attr_tensor(np.concatenate([bir.tensor, biz.tensor, bin.tensor], 0))
+                            b_h = self.create_attr_tensor(np.concatenate([bhr.tensor, bhz.tensor, bhn.tensor], 0))
 
                             input_mm = self.create_transform_tensor(
                                 np.matmul(t.tensor, np.transpose(w_i.tensor, [1, 0])) + b_i.tensor
                             )
+                            hidden_mm = self.create_transform_tensor(
+                                np.matmul(h.tensor, np.transpose(w_h.tensor, [1, 0])) + b_h.tensor
+                            )
+
                             ops.append(tfl.FullyConnectedOperator([t, w_i, b_i], [input_mm]))
-                            input_mm_list.append(input_mm)
+                            ops.append(tfl.FullyConnectedOperator([h, w_h, b_h], [hidden_mm]))
 
-                        if i != 0 or compute_h:
+                            left_in = np.split(input_mm.tensor, 3, axis=1)
+                            dim_tensor = self.create_attr_tensor(np.array([1], dtype='int32'))
+                            splited_left_in = [self.create_transform_tensor(t) for t in left_in]
 
-                            hidden_mm_list = []
-                            for j, (w_r, b_r) in enumerate(zip(w_r_list, b_r_list)):
+                            ops.append(tfl.SplitOperator([dim_tensor, input_mm], splited_left_in, 3))
 
-                                hidden_mm = self.create_transform_tensor(
-                                    np.matmul(h.tensor, np.transpose(w_r.tensor, [1, 0])) + b_r.tensor
-                                )
-                                ops.append(tfl.FullyConnectedOperator([h, w_r, b_r], [hidden_mm]))
-                                hidden_mm_list.append(hidden_mm)
+                            right_in = np.split(hidden_mm.tensor, 3, axis=-1)
+                            splited_right_in = [self.create_transform_tensor(t) for t in right_in]
+
+                            ops.append(tfl.SplitOperator([dim_tensor, hidden_mm], splited_right_in, 3))
+
+                            rgate_left_in, zgate_left_in, ngate_left_in = splited_left_in
+                            rgate_right_in, zgate_right_in, ngate_right_in_b = splited_right_in
+
+                            rgate_in = self.create_transform_tensor(rgate_left_in.tensor + rgate_right_in.tensor)
+                            ops.append(tfl.AddOperator([rgate_left_in, rgate_right_in], [rgate_in]))
+
+                            rgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(rgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([rgate_in], [rgate_out]))
+
+                            zgate_in = self.create_transform_tensor(zgate_left_in.tensor + zgate_right_in.tensor)
+                            ops.append(tfl.AddOperator([zgate_left_in, zgate_right_in], [zgate_in]))
+
+                            zgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(zgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([zgate_in], [zgate_out]))
+
+                            ngate_right_in = self.create_transform_tensor(rgate_out.tensor * ngate_right_in_b.tensor)
+                            ops.append(tfl.MulOperator([rgate_out, ngate_right_in_b], [ngate_right_in]))
+
+                            ngate_in = self.create_transform_tensor(ngate_left_in.tensor + ngate_right_in.tensor)
+                            ops.append(tfl.AddOperator([ngate_left_in, ngate_right_in], [ngate_in]))
+
+                            ngate_out = self.create_transform_tensor(
+                                torch.tanh(torch.from_numpy(ngate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.TanhOperator([ngate_in], [ngate_out]))
+
+                            constant_tensor = self.create_attr_tensor(torch.tensor(1, dtype=torch.float32))
+
+                            h_left_0 = self.create_transform_tensor(constant_tensor.tensor - zgate_out.tensor)
+                            ops.append(tfl.SubOperator([constant_tensor, zgate_out], [h_left_0]))
+
+                            h_left = self.create_transform_tensor(h_left_0.tensor * ngate_out.tensor)
+                            ops.append(tfl.MulOperator([h_left_0, ngate_out], [h_left]))
+
+                            if i != 0 or compute_h:
+                                h_right = self.create_transform_tensor(zgate_out.tensor * h.tensor)
+                                ops.append(tfl.MulOperator([zgate_out, h], [h_right]))
+
+                                h = self.create_transform_tensor(h_left.tensor + h_right.tensor)
+                                ops.append(tfl.AddOperator([h_left, h_right], [h]))
+
+                            elif i == 0 and not compute_h:
+                                h = h_left
+
+                            stacked_hs.append(h)
+
                         else:
-                            hidden_mm_list = b_r_list
+                            for j, (w_i, b_i) in enumerate(zip(w_i_list, b_i_list)):
 
-                        # calculate r,z,n gates
-                        rgate_in = self.create_transform_tensor(input_mm_list[0].tensor + hidden_mm_list[0].tensor)
-                        ops.append(tfl.AddOperator([input_mm_list[0], hidden_mm_list[0]], [rgate_in]))
+                                input_mm = self.create_transform_tensor(
+                                    np.matmul(t.tensor, np.transpose(w_i.tensor, [1, 0])) + b_i.tensor
+                                )
+                                ops.append(tfl.FullyConnectedOperator([t, w_i, b_i], [input_mm]))
+                                input_mm_list.append(input_mm)
 
-                        zgate_in = self.create_transform_tensor(input_mm_list[1].tensor + hidden_mm_list[1].tensor)
-                        ops.append(tfl.AddOperator([input_mm_list[1], hidden_mm_list[1]], [zgate_in]))
+                            if i != 0 or compute_h:
 
-                        zgate_out = self.create_transform_tensor(
-                            torch.sigmoid(torch.from_numpy(zgate_in.tensor)).numpy()
-                        )
+                                hidden_mm_list = []
+                                for j, (w_r, b_r) in enumerate(zip(w_r_list, b_r_list)):
 
-                        ops.append(tfl.LogisticOperator([zgate_in], [zgate_out]))
+                                    hidden_mm = self.create_transform_tensor(
+                                        np.matmul(h.tensor, np.transpose(w_r.tensor, [1, 0])) + b_r.tensor
+                                    )
+                                    ops.append(tfl.FullyConnectedOperator([h, w_r, b_r], [hidden_mm]))
+                                    hidden_mm_list.append(hidden_mm)
+                            else:
+                                hidden_mm_list = b_r_list
 
-                        rgate_out = self.create_transform_tensor(
-                            torch.sigmoid(torch.from_numpy(rgate_in.tensor)).numpy()
-                        )
-                        ops.append(tfl.LogisticOperator([rgate_in], [rgate_out]))
+                            # calculate r,z,n gates
+                            rgate_in = self.create_transform_tensor(input_mm_list[0].tensor + hidden_mm_list[0].tensor)
+                            ops.append(tfl.AddOperator([input_mm_list[0], hidden_mm_list[0]], [rgate_in]))
 
-                        ngate_in_hside = self.create_transform_tensor(rgate_out.tensor * hidden_mm_list[2].tensor)
-                        ops.append(tfl.MulOperator([rgate_out, hidden_mm_list[2]], [ngate_in_hside]))
+                            zgate_in = self.create_transform_tensor(input_mm_list[1].tensor + hidden_mm_list[1].tensor)
+                            ops.append(tfl.AddOperator([input_mm_list[1], hidden_mm_list[1]], [zgate_in]))
 
-                        ngate_in = self.create_transform_tensor(input_mm_list[2].tensor + ngate_in_hside.tensor)
-                        ops.append(tfl.AddOperator([input_mm_list[2], ngate_in_hside], [ngate_in]))
+                            zgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(zgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([zgate_in], [zgate_out]))
 
-                        ngate_out = self.create_transform_tensor(torch.tanh(torch.from_numpy(ngate_in.tensor)).numpy())
-                        ops.append(tfl.TanhOperator([ngate_in], [ngate_out]))
+                            rgate_out = self.create_transform_tensor(
+                                torch.sigmoid(torch.from_numpy(rgate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.LogisticOperator([rgate_in], [rgate_out]))
 
-                        constant_tensor = self.create_attr_tensor(torch.tensor(1, dtype=torch.float32))
+                            ngate_in_hside = self.create_transform_tensor(rgate_out.tensor * hidden_mm_list[2].tensor)
+                            ops.append(tfl.MulOperator([rgate_out, hidden_mm_list[2]], [ngate_in_hside]))
 
-                        h_left_0 = self.create_transform_tensor(constant_tensor.tensor - zgate_out.tensor)
-                        ops.append(tfl.SubOperator([constant_tensor, zgate_out], [h_left_0]))
+                            ngate_in = self.create_transform_tensor(input_mm_list[2].tensor + ngate_in_hside.tensor)
+                            ops.append(tfl.AddOperator([input_mm_list[2], ngate_in_hside], [ngate_in]))
 
-                        h_left = self.create_transform_tensor(h_left_0.tensor * ngate_out.tensor)
-                        ops.append(tfl.MulOperator([h_left_0, ngate_out], [h_left]))
+                            ngate_out = self.create_transform_tensor(
+                                torch.tanh(torch.from_numpy(ngate_in.tensor)).numpy()
+                            )
+                            ops.append(tfl.TanhOperator([ngate_in], [ngate_out]))
 
-                        if i != 0 or compute_h:
-                            h_right = self.create_transform_tensor(zgate_out.tensor * h.tensor)
-                            ops.append(tfl.MulOperator([zgate_out, h], [h_right]))
+                            constant_tensor = self.create_attr_tensor(torch.tensor(1, dtype=torch.float32))
 
-                            h = self.create_transform_tensor(h_left.tensor + h_right.tensor)
-                            ops.append(tfl.AddOperator([h_left, h_right], [h]))
+                            h_left_0 = self.create_transform_tensor(constant_tensor.tensor - zgate_out.tensor)
+                            ops.append(tfl.SubOperator([constant_tensor, zgate_out], [h_left_0]))
 
-                        elif i == 0 and not compute_h:
-                            h = h_left
+                            h_left = self.create_transform_tensor(h_left_0.tensor * ngate_out.tensor)
+                            ops.append(tfl.MulOperator([h_left_0, ngate_out], [h_left]))
 
-                        stacked_hs.append(h)
+                            if i != 0 or compute_h:
+                                h_right = self.create_transform_tensor(zgate_out.tensor * h.tensor)
+                                ops.append(tfl.MulOperator([zgate_out, h], [h_right]))
+
+                                h = self.create_transform_tensor(h_left.tensor + h_right.tensor)
+                                ops.append(tfl.AddOperator([h_left, h_right], [h]))
+
+                            elif i == 0 and not compute_h:
+                                h = h_left
+
+                            stacked_hs.append(h)
 
                     tf_out_state_tensors[0].append(h)
                     output_ts.extend(stacked_hs[::stride])
@@ -1127,7 +1213,7 @@ class ATenSubOperator(ATenSubSchema):
 
         if type(other) in (int, float, bool):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::sub(input, other)"
 
         self.elementwise_binary(tfl.SubOperator, graph_converter, True)
@@ -1145,7 +1231,7 @@ class ATenRsubOperator(ATenRsubSchema):
 
         if type(other) in (int, float, bool):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::rsub(input, other)"
 
         # Swap the first two input tensors and their names
@@ -1183,7 +1269,7 @@ class ATenMulOperator(ATenMulSchema):
 
         if type(other) in (int, float):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::mul(input, other)"
 
         self.elementwise_binary(tfl.MulOperator, graph_converter, True)
@@ -1253,7 +1339,7 @@ class ATenDivOperator(ATenDivSchema):
         other = self.input_tensors[1]
         if type(other) in (int, float):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::div(input, other)"
 
         self.elementwise_binary(tfl.DivOperator, graph_converter, True)
@@ -1277,7 +1363,7 @@ class ATenPowOperator(ATenPowSchema):
             torch.int32,
         ), "Input should be tensors of type torch.float32 or torch.int32"
 
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = torch.tensor([self.input_tensors[1]], dtype=self.input_tensors[0].dtype)
 
         self.elementwise_binary(tfl.PowOperator, graph_converter, True)
@@ -1653,7 +1739,7 @@ class ATenFloorDivideOperator(ATenFloorDivideSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = torch.tensor([self.input_tensors[1]], dtype=self.input_tensors[0].dtype)
         elif self.input_tensors[1].dtype != self.input_tensors[0].dtype:
             other = self.find_or_create_input(1, graph_converter)
@@ -1943,7 +2029,7 @@ class ATenAddOperator(ATenAddSchema):
 
         if type(other) in (int, float, bool):
             self.input_tensors[1] = torch.tensor([other], dtype=self.input_tensors[0].dtype)
-        elif type(other) != torch.Tensor:
+        elif not isinstance(other, torch.Tensor):
             assert False, "other should have type int, float, tensor in aten::add(input, other)"
 
         self.elementwise_binary(tfl.AddOperator, graph_converter, True)
@@ -2184,7 +2270,7 @@ class ATenNeOperator(ATenNeSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.NotEqualOperator, graph_converter, True)
@@ -3551,7 +3637,7 @@ class ATenEqOperator(ATenEqSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.EqualOperator, graph_converter, True)
@@ -3825,7 +3911,7 @@ class ATenMaximumOperator(ATenMaximumSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.MaximumOperator, graph_converter, True)
@@ -3836,7 +3922,7 @@ class ATenMinimumOperator(ATenMinimumSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.MinimumOperator, graph_converter, True)
@@ -3847,7 +3933,7 @@ class ATenGtOperator(ATenGtSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.GreaterOperator, graph_converter, True)
@@ -3858,7 +3944,7 @@ class ATenLtOperator(ATenLtSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.LessOperator, graph_converter, True)
@@ -3869,7 +3955,7 @@ class ATenGeOperator(ATenGeSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.GreaterEqualOperator, graph_converter, np.True_)
@@ -3880,7 +3966,7 @@ class ATenLeOperator(ATenLeSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = self.torch_tensor_from_scalar(self.input_tensors[0], self.input_tensors[1])
 
         self.elementwise_binary(tfl.LessEqualOperator, graph_converter, True)
@@ -3891,7 +3977,7 @@ class ATenRemainderOperator(ATenRemainderSchema):
         super().parse(node, attrs, args, graph_converter)
 
         self.run(node)
-        if type(self.input_tensors[1]) != torch.Tensor:
+        if not isinstance(self.input_tensors[1], torch.Tensor):
             self.input_tensors[1] = torch.tensor([self.input_tensors[1]], dtype=self.input_tensors[0].dtype)
 
         self.elementwise_binary(tfl.FloorModOperator, graph_converter, True)
@@ -3904,7 +3990,7 @@ class ATenWhereOperator(ATenWhereSchema):
         self.run(node)
         assert 'self' in args and 'other' in args, "aten::where(condition) is not supported"
 
-        if type(self.input_tensors[2]) != torch.Tensor:
+        if not isinstance(self.input_tensors[2], torch.Tensor):
             self.input_tensors[2] = torch.tensor([self.input_tensors[2]])
 
         ATenMaskedFillOperator.parse_common(self, graph_converter, input_idx=2, mask_idx=0, other_idx=1)

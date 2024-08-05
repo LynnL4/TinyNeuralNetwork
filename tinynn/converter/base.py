@@ -10,8 +10,8 @@ from .operators import CommonGraph, ExtendedOperator, GraphOptimizer, HybridQuan
 from .operators.op_version import OPVersioner
 from .operators.tflite import Tensor
 from .operators.torch import OPERATOR_CONVERTER_DICT
-from .operators.torch.base import NoTrackOperator, TrackQParamsOperator
-from .operators.torch.aten import ATenDequantizeOperator
+from .operators.torch.base import NoTrackOperator, TrackRevQParamsOperator, TrackQParamsOperator
+from .operators.torch.aten import ATenDequantizeOperator, ATenQuantizePerTensorOperator
 from ..util.converter_util import generate_converter_config
 from ..util.util import get_logger
 
@@ -52,6 +52,7 @@ class TFLiteConverter(object):
         conv_transpose_with_bias: bool = True,
         max_transpose_dims: int = -1,
         hybrid_conv: bool = True,
+        hybrid_int16_lstm: bool = False,
         unroll_rnn: bool = False,
         separated_rnn_gate_calc: bool = False,
         bypass_elementwise_passthrough_constraint: bool = False,
@@ -104,6 +105,7 @@ class TFLiteConverter(object):
             conv_transpose_with_bias (bool): ConvTranspose ops with bias. Defaults to True
             max_transpose_dims (int): Max dimensions for the `Transpose` op. Defaults to -1, which means unlimited
             hybrid_conv (bool): Enable hybrid quantization for Conv2d and DepthwiseConv2d. Defaults to True
+            hybrid_int16_lstm (bool): Enable hybrid int16 quantization for LSTM. Defaults to False
             unroll_rnn (bool): Unrolling LSTM (translate LSTM to seperate ops). Defaults to False
             separated_rnn_gate_calc (bool): Separated calculation for every gate in RNN. Effective only when \
                 `unroll_rnn=True`. Defaults to False
@@ -162,6 +164,7 @@ class TFLiteConverter(object):
         self.conv_transpose_with_bias = conv_transpose_with_bias
         self.max_transpose_dims = max_transpose_dims
         self.hybrid_conv = hybrid_conv
+        self.hybrid_int16_lstm = hybrid_int16_lstm
         self.unroll_rnn = unroll_rnn
         self.separated_rnn_gate_calc = separated_rnn_gate_calc
         self.bypass_elementwise_passthrough_constraint = bypass_elementwise_passthrough_constraint
@@ -433,6 +436,8 @@ class TFLiteConverter(object):
                 if no_track_flag:
                     if converter_type == ATenDequantizeOperator:
                         converter_type = TrackQParamsOperator
+                    elif converter_type == ATenQuantizePerTensorOperator:
+                        converter_type = TrackRevQParamsOperator
                     else:
                         converter_type = NoTrackOperator
                     converter = converter_type(
@@ -453,7 +458,7 @@ class TFLiteConverter(object):
             if k != 'prim::Constant':
                 log.debug(f'{k} {converter.input_names} -> {converter.output_names} {converter_type.__name__}')
             # Don't fetch attrs and schemas for non-tracking nodes
-            if converter_type not in (NoTrackOperator, TrackQParamsOperator):
+            if converter_type not in (NoTrackOperator, TrackRevQParamsOperator, TrackQParamsOperator):
                 try:
                     attrs = converter.fetch_all_attrs(node)
                 except StopIteration:
@@ -529,6 +534,7 @@ class TFLiteConverter(object):
                 self.bypass_elementwise_passthrough_constraint,
                 self.group_tensors,
                 self.conv_transpose_with_bias,
+                self.hybrid_int16_lstm,
             )
             optimizer.optimize()
 
@@ -541,6 +547,7 @@ class TFLiteConverter(object):
                     self.hybrid_q_type,
                     self.hybrid_per_channel,
                     self.hybrid_conv,
+                    self.hybrid_int16_lstm,
                     self.hybrid_gen_single_op_models,
                     self.hybrid_config,
                 )

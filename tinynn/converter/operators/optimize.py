@@ -51,6 +51,7 @@ class GraphOptimizer(object):
         bypass_elementwise_passthrough_constraint: bool = False,
         group_tensors: bool = False,
         conv_transpose_with_bias: bool = True,
+        hybrid_int16_lstm: bool = False,
     ) -> None:
         self.graph = graph
         self.fuse_tensor_count = 0
@@ -67,6 +68,7 @@ class GraphOptimizer(object):
         self.bypass_elementwise_passthrough_constraint = bypass_elementwise_passthrough_constraint
         self.group_tensors = group_tensors
         self.conv_transpose_with_bias = conv_transpose_with_bias
+        self.hybrid_int16_lstm = hybrid_int16_lstm
 
     def create_attr_tensor(
         self, tensor: tfl.Tensor, name: str = None, quantization: typing.Optional[tfl.QuantizationParameters] = None
@@ -500,6 +502,58 @@ class GraphOptimizer(object):
                 )
 
         # Delete div nodes
+        self.graph.graph.delete_vertices(remove_ids)
+
+    @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
+    def remove_tile_before_binary_elementwise_ops(self):
+        # Find fusable ops
+        edges = self.graph.graph.es.select(functools.partial(is_tile_binary_op_edge, graph_converter=self.graph.graph))
+        filtered_pairs = ((self.graph.graph.vs[x.source], self.graph.graph.vs[x.target], x) for x in edges)
+
+        remove_ids = []
+        actions = []
+        binary_op_ids = set()
+        for tile, op_node, tensor in filtered_pairs:
+            tile_op = tile['op']
+            binary_op = op_node['op']
+
+            input_idx = None
+            for i in range(2):
+                try:
+                    _ = tile['outputs'].index(binary_op.inputs[i].name)
+                    input_idx = i
+                    break
+                except ValueError:
+                    pass
+
+            if input_idx is None:
+                continue
+
+            alter_input_idx = 1 - input_idx
+            try:
+                out_shape = np.broadcast_shapes(binary_op.inputs[alter_input_idx].shape, tile_op.inputs[0].shape)
+                if out_shape != binary_op.outputs[0].shape:
+                    continue
+            except ValueError:
+                continue
+
+            if op_node.index not in binary_op_ids:
+                binary_op_ids.add(op_node.index)
+            else:
+                continue
+
+            new_tensor = tile_op.inputs[0]
+
+            # Replace input tensors
+            actions.append((self.graph.replace_operator_input, (op_node, input_idx, new_tensor)))
+
+            # remove tile op
+            remove_ids.append(tile.index)
+
+        # Process actions
+        for func, args in actions:
+            func(*args)
+        # Delete tile nodes
         self.graph.graph.delete_vertices(remove_ids)
 
     @class_conditional(lambda self: self.level >= GraphOptimizer.COMMON_OPTIMIZE)
@@ -1447,7 +1501,9 @@ class GraphOptimizer(object):
     @class_conditional(lambda self: self.rewrite_quantizable)
     def elementwise_op_quantize_passthrough_pass(self):
         edges = self.graph.graph.es.select(
-            functools.partial(is_quantize_elementwise_op_edge, graph_converter=self.graph.graph)
+            functools.partial(
+                is_quantize_elementwise_op_edge, graph_converter=self.graph.graph, with_lstm=self.hybrid_int16_lstm
+            )
         )
         pairs = ((self.graph.graph.vs[edge.source], self.graph.graph.vs[edge.target]) for edge in edges)
         filtered_nodes = (k[0] if k[0]['node_type'] != ExtendedOperator.DEQUANTIZE else k[1] for k in pairs)
@@ -3476,6 +3532,9 @@ class GraphOptimizer(object):
         # Fuse reciprocal and sqrt
         self.fuse_reciprocal_sqrt()
 
+        # Remove additional tile nodes before elementwise ops
+        self.remove_tile_before_binary_elementwise_ops()
+
         # Fuse activation
         self.fuse_activation()
 
@@ -3686,17 +3745,17 @@ def is_multi_output_op_node(vertex: ig.Vertex, graph_converter: ig.Graph):
     return vertex['node_type'] >= 0 and len(vertex['outputs']) > 1 and vertex.outdegree() > 0
 
 
-def is_quantize_elementwise_op_edge(edge: ig.Edge, graph_converter: ig.Graph):
+def is_quantize_elementwise_op_edge(edge: ig.Edge, graph_converter: ig.Graph, with_lstm: bool):
     source_vertex = graph_converter.vs[edge.source]
     target_vertex = graph_converter.vs[edge.target]
     return (
         (
             source_vertex['node_type'] == ExtendedOperator.DEQUANTIZE
-            and is_quantizable_rewrite_op(target_vertex['node_type'], target_vertex['op'])
+            and is_quantizable_rewrite_op(target_vertex['node_type'], target_vertex['op'], with_lstm)
         )
         or (
             target_vertex['node_type'] == ExtendedOperator.QUANTIZE
-            and is_quantizable_rewrite_op(source_vertex['node_type'], source_vertex['op'])
+            and is_quantizable_rewrite_op(source_vertex['node_type'], source_vertex['op'], with_lstm)
         )
     ) and target_vertex['op'].inputs[0].name in source_vertex['outputs']
 
@@ -3846,7 +3905,7 @@ def is_elementwise_unary_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
     ) or is_elementwise_reduce_op(op_code, op)
 
 
-def is_quantizable_rewrite_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
+def is_quantizable_rewrite_op(op_code: ExtendedOperator, op: tfl.BaseOperator, with_lstm: bool):
     return op_code in (
         ExtendedOperator.BATCH_MATMUL,
         ExtendedOperator.SOFTMAX,
@@ -3857,7 +3916,7 @@ def is_quantizable_rewrite_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
         ExtendedOperator.RSQRT,
         ExtendedOperator.MAXIMUM,
         ExtendedOperator.MINIMUM,
-    )
+    ) or (with_lstm and op_code == ExtendedOperator.UNIDIRECTIONAL_SEQUENCE_LSTM)
 
 
 def is_elementwise_binary_op(op_code: ExtendedOperator, op: tfl.BaseOperator):
@@ -4141,6 +4200,23 @@ def is_reciprocal_sqrt_edge(edge: ig.Edge, graph_converter: ig.Graph):
     return (
         source_vertex['node_type'] == ExtendedOperator.SQRT
         and target_vertex['node_type'] == ExtendedOperator.DIV
+        and source_vertex.outdegree() == 1
+    )
+
+
+def is_tile_binary_op_edge(edge: ig.Edge, graph_converter: ig.Graph):
+    source_vertex = graph_converter.vs[edge.source]
+    target_vertex = graph_converter.vs[edge.target]
+
+    return (
+        source_vertex['node_type'] == ExtendedOperator.TILE
+        and target_vertex['node_type']
+        in (
+            ExtendedOperator.ADD,
+            ExtendedOperator.SUB,
+            ExtendedOperator.MUL,
+            ExtendedOperator.DIV,
+        )
         and source_vertex.outdegree() == 1
     )
 

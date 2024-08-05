@@ -1,13 +1,14 @@
 import unittest
 from distutils.version import LooseVersion
 
-import numpy as np
-import tensorflow as tf
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
 from common_utils import IS_CI
+
+import numpy as np
+
+import tensorflow as tf
 
 from tinynn.converter import TFLiteConverter
 
@@ -2286,6 +2287,28 @@ class ConverterOPTester(unittest.TestCase):
         tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
         assert_close(dummy_output, tfl_output)
 
+    def test_add_param(self):
+        dummy_input = torch.randn(9, 17, dtype=torch.float32)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.param = nn.Parameter(torch.tensor(2.0))
+
+            def forward(self, x):
+                return x + self.param
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(model, dummy_input, model_path, nchw_transpose=False)
+        converter.convert()
+
+        dummy_output = model(dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
     def test_addmm(self):
         dummy_input = torch.randn(9, 17, dtype=torch.float32)
         mat = torch.randn(17, 22, dtype=torch.float32)
@@ -2952,6 +2975,30 @@ class ConverterOPTester(unittest.TestCase):
         tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
         assert_close(dummy_output, tfl_output)
 
+    def test_gru_unroll_unseparated(self):
+        dummy_input = torch.randn(9, 1, 10, dtype=torch.float32)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20)
+
+            def forward(self, x):
+                return self.gru(x)[0]
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
+        )
+        converter.convert()
+
+        dummy_output = model(dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
     def test_gru_batch_first_unroll_separated(self):
         dummy_input = torch.randn(1, 9, 10, dtype=torch.float32)
 
@@ -2969,6 +3016,30 @@ class ConverterOPTester(unittest.TestCase):
         model_path = get_model_path()
         converter = TFLiteConverter(
             model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=True
+        )
+        converter.convert()
+
+        dummy_output = model(dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output, check_stride=False)
+
+    def test_gru_batch_first_unroll_unseparated(self):
+        dummy_input = torch.randn(1, 9, 10, dtype=torch.float32)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20, batch_first=True)
+
+            def forward(self, x):
+                return self.gru(x)[0]
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
         )
         converter.convert()
 
@@ -3004,6 +3075,34 @@ class ConverterOPTester(unittest.TestCase):
         tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
         assert_close(dummy_output, tfl_output)
 
+    def test_gru_with_state_tensor_unroll_unseparated(self):
+        dummy_input = [
+            torch.randn(9, 1, 10, dtype=torch.float32),
+            torch.randn(1, 1, 20, dtype=torch.float32),
+        ]
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20)
+
+            def forward(self, x, hx):
+                gru, hx = self.gru(x, hx)
+                return gru, hx
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
+        )
+        converter.convert()
+
+        dummy_output = model(*dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
     def test_gru_multi_layer_unroll_separated(self):
         dummy_input = torch.randn(9, 1, 10, dtype=torch.float32)
 
@@ -3021,6 +3120,30 @@ class ConverterOPTester(unittest.TestCase):
         model_path = get_model_path()
         converter = TFLiteConverter(
             model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=True
+        )
+        converter.convert()
+
+        dummy_output = model(dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
+    def test_gru_multi_layer_unroll_unseparated(self):
+        dummy_input = torch.randn(9, 1, 10, dtype=torch.float32)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20, 2)
+
+            def forward(self, x):
+                return self.gru(x)[0]
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
         )
         converter.convert()
 
@@ -3049,6 +3172,34 @@ class ConverterOPTester(unittest.TestCase):
         model_path = get_model_path()
         converter = TFLiteConverter(
             model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=True
+        )
+        converter.convert()
+
+        dummy_output = model(*dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
+    def test_gru_multi_layer_with_state_tensor_unroll_unseparated(self):
+        dummy_input = [
+            torch.randn(9, 1, 10, dtype=torch.float32),
+            torch.randn(2, 1, 20, dtype=torch.float32),
+        ]
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20, 2)
+
+            def forward(self, x, hx):
+                gru, hx = self.gru(x, hx)
+                return gru, hx
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
         )
         converter.convert()
 
@@ -3278,6 +3429,30 @@ class ConverterOPTester(unittest.TestCase):
         tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
         assert_close(dummy_output, tfl_output)
 
+    def test_bigru_unroll_unseparated(self):
+        dummy_input = torch.randn(9, 1, 10, dtype=torch.float32)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20, bidirectional=True)
+
+            def forward(self, x):
+                return self.gru(x)[0]
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
+        )
+        converter.convert()
+
+        dummy_output = model(dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
     def test_bigru_multi_layer_unroll_separated(self):
         dummy_input = torch.randn(9, 1, 10, dtype=torch.float32)
 
@@ -3295,6 +3470,30 @@ class ConverterOPTester(unittest.TestCase):
         model_path = get_model_path()
         converter = TFLiteConverter(
             model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=True
+        )
+        converter.convert()
+
+        dummy_output = model(dummy_input)
+        tfl_output = tfl_run_model(model_path, dummy_input, dummy_output)
+        assert_close(dummy_output, tfl_output)
+
+    def test_bigru_multi_layer_unroll_unseparated(self):
+        dummy_input = torch.randn(9, 1, 10, dtype=torch.float32)
+
+        class Model(nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.gru = nn.GRU(10, 20, 2, bidirectional=True)
+
+            def forward(self, x):
+                return self.gru(x)[0]
+
+        model = Model()
+        model.eval()
+
+        model_path = get_model_path()
+        converter = TFLiteConverter(
+            model, dummy_input, model_path, nchw_transpose=False, unroll_rnn=True, separated_rnn_gate_calc=False
         )
         converter.convert()
 
@@ -4680,7 +4879,11 @@ class ConverterOPTester(unittest.TestCase):
             converter.convert()
 
             dummy_output = model(dummy_input)
-            tfl_output = tfl_run_model(model_path, dummy_input.permute(0, 2, 3, 1), dummy_output).permute(0, 3, 1, 2)
+            tfl_output = (
+                tfl_run_model(model_path, dummy_input.permute(0, 2, 3, 1), dummy_output)
+                .permute(0, 3, 1, 2)
+                .contiguous()
+            )
 
             def msg(*args, **kwargs):
                 return f'testing {type(func).__name__} failed: {args}'

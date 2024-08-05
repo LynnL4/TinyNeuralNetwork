@@ -664,7 +664,7 @@ class OperatorConverter(ABC):
 
     def torch_tensor_from_scalar(self, ref_tensor: torch.Tensor, src_tensor: torch.Tensor):
         tgt_tensor = src_tensor
-        if type(src_tensor) != torch.Tensor:
+        if not isinstance(src_tensor, torch.Tensor):
             if ref_tensor.is_quantized:
                 tgt_tensor = torch.quantize_per_tensor(
                     torch.tensor([src_tensor], dtype=torch.float32),
@@ -770,6 +770,16 @@ class TrackQParamsOperator(OperatorConverter):
 
         t = self.find_or_create_input(0, graph_converter)
         graph_converter.q_mapping[self.output_names[0]] = t
+
+
+class TrackRevQParamsOperator(OperatorConverter):
+    def parse(self, node, attrs, args, graph_converter):
+        super().parse(node, attrs, args, graph_converter)
+
+        self.run(node)
+
+        t = self.to_tfl_tensors(self.output_names, self.output_tensors)[0]
+        graph_converter.rev_q_mapping[self.input_names[0]] = t
 
 
 class TrackConstantOperator(OperatorConverter):
