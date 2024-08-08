@@ -4492,4 +4492,3 @@ class ATenBroadcastTensorsOperator(ATenBroadcastTensorsSchema):
 
         for op in ops:
             graph_converter.add_operator(op)
-            
